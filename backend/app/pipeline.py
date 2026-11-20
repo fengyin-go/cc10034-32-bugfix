@@ -2,11 +2,67 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
+
+
+def event_source_coord(event: Mapping[str, Any] | Any) -> str:
+    """返回变更数据的源坐标。
+
+    源坐标是重放和回执的唯一标识：优先使用 GTID，其次使用
+    ``binlog_file:binlog_pos``，最后退化为事件 ID。调用方同时支持
+    ``ChangeEventRecord`` 和普通字典（中文业务字段）。
+    """
+    def _pick(*names: str) -> Any:
+        for name in names:
+            value = event.get(name) if isinstance(event, Mapping) else getattr(event, name, None)
+            if value not in (None, ""):
+                return value
+        return None
+
+    explicit = _pick("源坐标", "source_coord")
+    if explicit:
+        return str(explicit)
+    gtid = _pick("gtid", "Gtid集合")
+    if gtid:
+        return str(gtid)
+    binlog_file = _pick("binlog_file", "Binlog名称")
+    binlog_pos = _pick("binlog_pos", "位点值")
+    if binlog_file is not None and binlog_pos is not None:
+        return f"{binlog_file}:{binlog_pos}"
+    event_id = _pick("event_id", "事件ID", "id")
+    return str(event_id) if event_id is not None else ""
+
+
+def parse_event_time(event: Mapping[str, Any] | Any) -> datetime | None:
+    """解析事件时间，统一返回本地朴素时间，失败返回 None。
+
+    统一去掉时区信息，避免窗口区间比较时出现 aware/naive 混用。
+    """
+    raw = event.get("事件时间") if isinstance(event, Mapping) else getattr(event, "event_time", None)
+    if isinstance(raw, datetime):
+        return raw.astimezone().replace(tzinfo=None) if raw.tzinfo else raw
+    if raw in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def json_text(value: Any) -> str:
+    """把镜像等结构稳定序列化为文本，便于清单落库和比对。"""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
 
 
 @dataclass
@@ -65,6 +121,33 @@ class CheckpointRecord:
     data_checksum: str
 
 
+@dataclass
+class DedupWindowRecord:
+    """按事件时间锚定的去重窗口。
+
+    窗口区间是 ``[start, end)``；同一去重键可以存在多个相邻甚至互相重叠的窗口。
+    一条变更数据（以源坐标标识）只能归入其中一个窗口，归属规则由
+    ``DedupWindowService`` 统一裁决，保证重放和换序提交得到相同结果。
+    """
+    window_id: str
+    key: str
+    start: datetime
+    end: datetime
+    size_sec: float
+    strategy: str
+    sequence: int
+    entries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    suppressed: list[dict[str, Any]] = field(default_factory=list)
+    selected_coord: str | None = None
+    delivered: bool = False
+    delivered_coord: str | None = None
+    delivered_at: datetime | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def contains(self, moment: datetime) -> bool:
+        return self.start <= moment < self.end
+
+
 class PipelineBus:
     """管道级事件总线：持有事件队列、Schema 注册表、位点注册表、SCD 状态存储。
 
@@ -88,6 +171,15 @@ class PipelineBus:
         self.scd_type3_store: dict[str, dict[str, Any]] = {}  # prev-col
         # 去重状态 — dedup_window 核心存储
         self.dedup_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # 按事件时间锚定的去重窗口；同一去重键可存在多个相邻/重叠窗口
+        self.dedup_windows: list[DedupWindowRecord] = []
+        # 去重后的变更明细（交付清单）— dedup_window 产出，change_event 消费
+        self.dedup_manifest: list[dict[str, Any]] = []
+        # 已消费回执：源坐标 -> 回执，保证重复提交/重放只记一笔
+        self.consumed_coords: dict[str, dict[str, Any]] = {}
+        # 入窗归属冲突留痕，便于按当时的窗口复核
+        self.dedup_conflicts: list[dict[str, Any]] = []
+        self._window_seq = 0
         # 路由规则 — route_dispatcher 核心配置
         self.routing_table: list[dict[str, Any]] = []
         # 过滤规则 — event_filter 核心配置
@@ -134,6 +226,10 @@ class PipelineBus:
         self.event_queue = self.event_queue[batch_size:]
         self.pipeline_metrics["total_output"] += len(batch)
         return batch
+
+    def count_manifest_delivery(self, count: int) -> None:
+        """统计去重清单交付量，让运营概览的消费卡片与实际派发一致。"""
+        self.pipeline_metrics["total_output"] += count
 
     def register_position(self, pos: PositionSnapshot) -> None:
         """注册存储位点。"""
@@ -199,6 +295,98 @@ class PipelineBus:
                 return True  # 重复
         buffer.append({"event_id": event_id, "ts": now})
         return False
+
+    # ------------------------------------------------------------------
+    # 按事件时间锚定的窗口去重
+    # ------------------------------------------------------------------
+    def next_window_sequence(self) -> int:
+        """分配窗口创建序号，用于同键窗口的稳定排序（与提交顺序无关）。"""
+        self._window_seq += 1
+        return self._window_seq
+
+    def register_dedup_window(self, window: DedupWindowRecord) -> None:
+        """登记去重窗口。"""
+        self.dedup_windows.append(window)
+
+    def windows_for_key(self, key: str) -> list[DedupWindowRecord]:
+        """返回某个去重键的全部窗口，按锚定时间与创建序号稳定排序。"""
+        return sorted(
+            (w for w in self.dedup_windows if w.key == key),
+            key=lambda w: (w.start, w.end, w.sequence),
+        )
+
+    def find_window(self, window_id: str) -> DedupWindowRecord | None:
+        for window in self.dedup_windows:
+            if window.window_id == window_id:
+                return window
+        return None
+
+    def record_dedup_conflict(self, conflict: dict[str, Any]) -> None:
+        """记录入窗归属冲突，保留两边当时的候选窗口以便复核。"""
+        self.dedup_conflicts.append(conflict)
+
+    def is_delivered(self, coord: str) -> bool:
+        """源坐标是否已经交付（回执落库即视为已交付）。"""
+        return coord in self.consumed_coords
+
+    def note_repeat_submission(self, coord: str) -> int:
+        """记录一次重复提交，返回累计的重复次数。"""
+        receipt = self.consumed_coords.get(coord)
+        if receipt is None:
+            return 0
+        receipt["repeat_submissions"] = receipt.get("repeat_submissions", 0) + 1
+        self.pipeline_metrics["dedup_hits"] += 1
+        return receipt["repeat_submissions"]
+
+    def record_receipt(
+        self,
+        coord: str,
+        *,
+        window_id: str,
+        window_start: datetime,
+        window_end: datetime,
+        event_id: str,
+        manifest_key: str,
+        consumer: str,
+        result: dict[str, Any],
+        duplicate_of: str | None = None,
+    ) -> bool:
+        """落库消费回执。返回 True 表示首次落库，False 表示重复提交只记一笔。"""
+        if coord in self.consumed_coords:
+            self.consumed_coords[coord]["repeat_submissions"] = (
+                self.consumed_coords[coord].get("repeat_submissions", 0) + 1
+            )
+            return False
+        self.consumed_coords[coord] = {
+            "源坐标": coord,
+            "窗口ID": window_id,
+            "窗口区间": [window_start.isoformat(), window_end.isoformat()],
+            "事件ID": event_id,
+            "清单键": manifest_key,
+            "消费者": consumer,
+            "执行结果": result,
+            "结果写回": "已回写去重清单",
+            "重复于": duplicate_of,
+            "已交付": True,
+            "回执时间": datetime.now().isoformat(),
+            "repeat_submissions": 0,
+        }
+        return True
+
+    def write_receipt_result(self, coord: str, result_key: str, value: Any) -> None:
+        """把执行结果回写到已落库回执。"""
+        receipt = self.consumed_coords.get(coord)
+        if receipt is not None:
+            receipt.setdefault("执行结果", {})[result_key] = value
+            receipt["结果写回"] = "已回写去重清单"
+
+    def update_manifest_entry(self, coord: str, **changes: Any) -> dict[str, Any] | None:
+        """把消费状态回写到去重清单中的对应条目。"""
+        for entry in self.dedup_manifest:
+            if entry.get("源坐标") == coord:
+                entry.update(changes)
+                return entry
+        return None
 
     def evaluate_filter(self, event: ChangeEventRecord) -> tuple[bool, list[str]]:
         """评估过滤规则，返回 (是否通过, 匹配规则列表)。"""
